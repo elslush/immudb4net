@@ -59,7 +59,7 @@ public class ConnectionParameters
     /// Gets or sets the address
     /// </summary>
     /// <value></value>
-    public string Address { get; set; } = "";
+    public string Address { get; set; } = string.Empty;
     /// <summary>
     /// Gets or  sets the length of time the connection close operation is allowed to block before it completes.
     /// </summary>

@@ -14,23 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+using static Google.Rpc.Context.AttributeContext.Types;
+using System.Text;
+
 namespace ImmuDB;
 
 /// <summary>
 /// Represents a key-value pair
 /// </summary>
-public class KVPair
+public readonly ref struct KVPair
 {
     /// <summary>
     /// The key
     /// </summary>
     /// <value></value>
-    public byte[] Key { get; private set; }
+    public ReadOnlySpan<byte> Key { get; }
     /// <summary>
     /// The value
     /// </summary>
     /// <value></value>
-    public byte[] Value { get; private set; }
+    public ReadOnlySpan<byte> Value { get; }
 
     /// <summary>
     /// Creates a new key value pair
@@ -38,17 +41,19 @@ public class KVPair
     /// <param name="key">The key</param>
     /// <param name="value">The value</param>
     /// <returns></returns>
-    public KVPair(string key, byte[] value) :
-        this(Utils.ToByteArray(key), value)
-    {
-    }
+    //public KVPair(ReadOnlySpan<char> key, byte[] value)
+    //{
+    //    var byteCount = Encoding.UTF8.GetByteCount(key);
+    //    Span<byte> sourceBytes = stackalloc byte[byteCount];
+    //    byteCount = Encoding.UTF8.GetBytes(key, sourceBytes);
+    //}
 
     /// <summary>
     /// Creates a new key value pair
     /// </summary>
     /// <param name="key">The key</param>
     /// <param name="value">The value</param>
-    public KVPair(byte[] key, byte[] value)
+    public KVPair(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         this.Key = key;
         this.Value = value;

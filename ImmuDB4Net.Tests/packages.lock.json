@@ -1171,15 +1171,7 @@
         }
       },
       "immudb4net": {
-        "type": "Project",
-        "dependencies": {
-          "Google.Api.CommonProtos": "2.6.0",
-          "Google.Protobuf": "3.21.2",
-          "Grpc.Net.Client": "2.46.0",
-          "Grpc.Net.ClientFactory": "2.46.0",
-          "Portable.BouncyCastle": "1.9.0",
-          "System.Text.Json": "6.0.5"
-        }
+        "type": "Project"
       }
     }
   }

@@ -16,6 +16,8 @@ limitations under the License.
 
 namespace ImmuDB;
 
+using System.Buffers;
+using System.Text;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
 using Google.Protobuf.WellKnownTypes;
@@ -25,7 +27,8 @@ using ImmuDB.Exceptions;
 using ImmuDB.SQL;
 using ImmudbProxy;
 using Org.BouncyCastle.Crypto;
-
+using System.IO.MemoryMappedFiles;
+using System.Runtime.InteropServices;
 
 /// <summary>
 /// Class ImmuClient provides the awaitable API for accessing an ImmuDB server. If synchronous support is needed, use <see cref="ImmuClientSync" />
@@ -67,7 +70,7 @@ public partial class ImmuClient
     }
     internal IConnectionPool ConnectionPool { get; set; }
     internal ISessionManager SessionManager { get; set; }
-    internal object sessionSync = new Object();
+    internal object sessionSync = new();
     internal int sessionSetupInProgress = 0;
 
     internal ManualResetEvent? heartbeatCalled;
@@ -89,13 +92,7 @@ public partial class ImmuClient
             }
         }
     }
-    internal IImmuStateHolder StateHolder
-    {
-        get
-        {
-            return stateHolder;
-        }
-    }
+    internal IImmuStateHolder StateHolder => stateHolder;
 
     /// <summary>
     /// Gets or sets the DeploymentInfoCheck flag. If enabled then a check of server authenticity is perform while establishing a new link with the ImmuDB server.
@@ -163,7 +160,27 @@ public partial class ImmuClient
     /// <returns></returns>
     public ImmuClient() : this(NewBuilder())
     {
+        //long offset = 0x10000000; // 256 megabytes
+        //long length = 0x20000000; // 512 megabytes
+        //using (var mmf = MemoryMappedFile.CreateFromFile(@"c:\ExtremelyLargeImage.data", FileMode.Open, "ImgA"))
+        //{
+        //    // Create a random access view, from the 256th megabyte (the offset)
+        //    // to the 768th megabyte (the offset plus length).
+        //    using (var accessor = mmf.CreateViewAccessor(offset, length))
+        //    {
+        //        accessor.rea<byte>
+        //        int colorSize = Marshal.SizeOf(typeof(MyColor));
+        //        MyColor color;
 
+        //        // Make changes to the view.
+        //        for (long i = 0; i < length; i += colorSize)
+        //        {
+        //            accessor.Read(i, out color);
+        //            color.Brighten(10);
+        //            accessor.Write(i, ref color);
+        //        }
+        //    }
+        //}
     }
 
     /// <summary>
@@ -171,7 +188,7 @@ public partial class ImmuClient
     /// </summary>
     /// <param name="serverUrl">The ImmuDB server address, e.g. localhost or http://localhost </param>
     /// <param name="serverPort">The port where the ImmuDB server listens</param>
-    public ImmuClient(string serverUrl, int serverPort)
+    public ImmuClient(ReadOnlySpan<char> serverUrl, in int serverPort)
         : this(NewBuilder().WithServerUrl(serverUrl).WithServerPort(serverPort))
     {
     }
@@ -179,7 +196,7 @@ public partial class ImmuClient
     internal ImmuClient(ImmuClientBuilder builder)
     {
         ConnectionPool = builder.ConnectionPool;
-        GrpcAddress = builder.GrpcAddress;
+        GrpcAddress = builder.GetGrpcAddress();
         connection = releasedConnection;
         SessionManager = builder.SessionManager;
         serverSigningKey = builder.ServerSigningKey;
@@ -270,7 +287,7 @@ public partial class ImmuClient
 
                     ulong sourceId;
                     ulong targetId;
-                    byte[] sourceAlh;
+                    Span<byte> sourceAlh = stackalloc byte[32];
                     byte[] targetAlh;
                     if (localState.TxId <= serverState.TxId)
                     {
@@ -422,7 +439,7 @@ public partial class ImmuClient
         }
     }
 
-    private object stateSync = new Object();
+    private readonly object stateSync = new();
 
     /// <summary>
     /// Gets the database state data and if not present updates it from the server
@@ -460,7 +477,7 @@ public partial class ImmuClient
         get
         {
             CheckSessionHasBeenOpened();
-            ImmudbProxy.ImmutableState state = Service.CurrentState(new Empty(), Service.GetHeaders(ActiveSession));
+            ImmutableState state = Service.CurrentState(new Empty(), Service.GetHeaders(ActiveSession));
             ImmuState immuState = ImmuState.ValueOf(state);
             if (!immuState.CheckSignature(serverSigningKey))
             {
@@ -479,15 +496,16 @@ public partial class ImmuClient
     /// </summary>
     /// <param name="database">The database name</param>
     /// <returns></returns>
-    public async Task CreateDatabase(string database)
+    public Task CreateDatabase(in string database)
     {
         CheckSessionHasBeenOpened();
-        ImmudbProxy.CreateDatabaseRequest db = new ImmudbProxy.CreateDatabaseRequest
+        CreateDatabaseRequest db = new()
         {
             Name = database
         };
 
-        await Service.CreateDatabaseV2Async(db, Service.GetHeaders(ActiveSession));
+        return Service.CreateDatabaseV2Async(db, Service.GetHeaders(ActiveSession))
+            .ResponseAsync;
     }
 
     /// <summary>
@@ -495,15 +513,17 @@ public partial class ImmuClient
     /// </summary>
     /// <param name="database">The newly selected database. It must be an existing one.</param>
     /// <returns></returns>
-    public async Task UseDatabase(string database)
+    public Task UseDatabase(in string database, CancellationToken cancellationToken = default)
     {
         CheckSessionHasBeenOpened();
-        ImmudbProxy.Database db = new ImmudbProxy.Database
+        Database db = new()
         {
             DatabaseName = database
         };
-        ImmudbProxy.UseDatabaseReply response = await Service.UseDatabaseAsync(db, Service.GetHeaders(ActiveSession));
         currentDb = database;
+        return Service.UseDatabaseAsync(db, Service.GetHeaders(ActiveSession), cancellationToken: cancellationToken)
+            .ResponseAsync;
+        
     }
 
     /// <summary>
@@ -511,17 +531,14 @@ public partial class ImmuClient
     /// </summary>
     /// <remarks>The function returns only the name of the databases where the user has access to</remarks>
     /// <returns>The server's database list</returns>
-    public async Task<List<string>> Databases()
+    public async IAsyncEnumerable<string> Databases()
     {
         CheckSessionHasBeenOpened();
-        ImmudbProxy.DatabaseListRequestV2 req = new ImmudbProxy.DatabaseListRequestV2();
-        ImmudbProxy.DatabaseListResponseV2 res = await Service.DatabaseListV2Async(req, Service.GetHeaders(ActiveSession));
-        List<string> list = new List<string>(res.Databases.Count);
+        DatabaseListRequestV2 req = new();
+        DatabaseListResponseV2 res = await Service.DatabaseListV2Async(req, Service.GetHeaders(ActiveSession));
+
         foreach (ImmudbProxy.DatabaseWithSettings db in res.Databases)
-        {
-            list.Add(db.Name);
-        }
-        return list;
+            yield return db.Name;
     }
 
     //
@@ -534,17 +551,17 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction id</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> Get(byte[] key, ulong tx)
+    public async Task<Entry> Get(ReadOnlyMemory<byte> key, ulong tx)
     {
         CheckSessionHasBeenOpened();
-        ImmudbProxy.KeyRequest req = new ImmudbProxy.KeyRequest
+        KeyRequest req = new()
         {
             Key = Utils.ToByteString(key),
             AtTx = tx
         };
         try
         {
-            ImmudbProxy.Entry entry = await Service.GetAsync(req, Service.GetHeaders(ActiveSession));
+            var entry = await Service.GetAsync(req, Service.GetHeaders(ActiveSession));
             return Entry.ValueOf(entry);
         }
         catch (RpcException e)
@@ -564,9 +581,15 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction id</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> Get(string key, ulong tx)
+    public Task<Entry> Get(ReadOnlySpan<char> key, in ulong tx)
     {
-        return await Get(Utils.ToByteArray(key), tx);
+        var byteCount = Encoding.UTF8.GetByteCount(key);
+        IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(byteCount);
+        var memory = owner.Memory;
+        var bufferSpan = memory[..byteCount].Span;
+        byteCount = Encoding.UTF8.GetBytes(key, bufferSpan);
+
+        return Get(memory[..byteCount], tx);
     }
 
     /// <summary>
@@ -574,9 +597,9 @@ public partial class ImmuClient
     /// </summary>
     /// <param name="key">The lookup key</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> Get(string key)
+    public Task<Entry> Get(ReadOnlySpan<char> key)
     {
-        return await Get(Utils.ToByteArray(key), 0);
+        return Get(key, 0);
     }
 
     /// <summary>
@@ -699,20 +722,14 @@ public partial class ImmuClient
     /// </summary>
     /// <param name="key">The lookup key</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGet(string key)
-    {
-        return await VerifiedGetAtTx(key, 0);
-    }
+    public Task<Entry> VerifiedGet(string key) => VerifiedGetAtTx(key, 0);
 
     /// <summary>
     /// Retrieves with authenticity check the value for a specific key. The assumed default TxID is 0
     /// </summary>
     /// <param name="key">The lookup key</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGet(byte[] key)
-    {
-        return await VerifiedGetAtTx(key, 0);
-    }
+    public Task<Entry> VerifiedGet(ReadOnlyMemory<byte> key) => VerifiedGetAtTx(key, 0);
 
     /// <summary>
     /// Retrieves with authenticity check the value for a specific key
@@ -720,9 +737,16 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction ID</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGetAtTx(string key, ulong tx)
+    public Task<Entry> VerifiedGetAtTx(ReadOnlySpan<char> key, in ulong tx)
     {
-        return await VerifiedGetAtTx(Utils.ToByteArray(key), tx);
+        var byteCount = Encoding.UTF8.GetByteCount(key);
+        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(byteCount);
+
+        var memory = owner.Memory;
+
+        byteCount = Encoding.UTF8.GetBytes(key, memory.Span);
+
+        return VerifiedGetAtTx(memory[..byteCount], tx);
     }
 
     /// <summary>
@@ -731,7 +755,7 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction ID</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGetAtTx(byte[] key, ulong tx)
+    public Task<Entry> VerifiedGetAtTx(ReadOnlyMemory<byte> key, in ulong tx)
     {
         ImmudbProxy.KeyRequest keyReq = new ImmudbProxy.KeyRequest()
         {
@@ -739,7 +763,7 @@ public partial class ImmuClient
             AtTx = tx
         };
 
-        return await VerifiedGet(keyReq, State);
+        return VerifiedGet(keyReq, State);
     }
 
     /// <summary>
@@ -748,9 +772,14 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction ID after which the server is allowed to ignore changes to the key</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGetSinceTx(string key, ulong tx)
+    public Task<Entry> VerifiedGetSinceTx(ReadOnlySpan<char> key, in ulong tx)
     {
-        return await VerifiedGetSinceTx(Utils.ToByteArray(key), tx);
+        var byteCount = Encoding.UTF8.GetByteCount(key);
+        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(byteCount);
+        var memory = owner.Memory;
+
+        byteCount = Encoding.UTF8.GetBytes(key, memory.Span);
+        return VerifiedGetSinceTx(memory[..byteCount], tx);
     }
 
     /// <summary>
@@ -759,7 +788,7 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction ID</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGetSinceTx(byte[] key, ulong tx)
+    public Task<Entry> VerifiedGetSinceTx(ReadOnlyMemory<byte> key, in ulong tx)
     {
         ImmudbProxy.KeyRequest keyReq = new ImmudbProxy.KeyRequest()
         {
@@ -767,7 +796,7 @@ public partial class ImmuClient
             SinceTx = tx
         };
 
-        return await VerifiedGet(keyReq, State);
+        return VerifiedGet(keyReq, State);
     }
 
     /// <summary>
@@ -776,9 +805,14 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="rev">The revision number</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGetAtRevision(string key, long rev)
+    public Task<Entry> VerifiedGetAtRevision(ReadOnlySpan<char> key, in long rev)
     {
-        return await VerifiedGetAtRevision(Utils.ToByteArray(key), rev);
+        var byteCount = Encoding.UTF8.GetByteCount(key);
+        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(byteCount);
+        var memory = owner.Memory;
+
+        byteCount = Encoding.UTF8.GetBytes(key, memory.Span);
+        return VerifiedGetAtRevision(memory[..byteCount], rev);
     }
 
     /// <summary>
@@ -787,7 +821,7 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="rev">The transaction ID</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> VerifiedGetAtRevision(byte[] key, long rev)
+    public Task<Entry> VerifiedGetAtRevision(ReadOnlyMemory<byte> key, in long rev)
     {
         ImmudbProxy.KeyRequest keyReq = new ImmudbProxy.KeyRequest()
         {
@@ -795,7 +829,7 @@ public partial class ImmuClient
             AtRevision = rev
         };
 
-        return await VerifiedGet(keyReq, State);
+        return VerifiedGet(keyReq, State);
     }
 
     /// <summary>
@@ -804,9 +838,14 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction ID</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> GetSinceTx(string key, ulong tx)
+    public Task<Entry> GetSinceTx(ReadOnlySpan<char> key, in ulong tx)
     {
-        return await GetSinceTx(Utils.ToByteArray(key), tx);
+        var byteCount = Encoding.UTF8.GetByteCount(key);
+        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(byteCount);
+        var memory = owner.Memory;
+
+        byteCount = Encoding.UTF8.GetBytes(key, memory.Span);
+        return GetSinceTx(memory[..byteCount], tx);
     }
 
     /// <summary>
@@ -815,7 +854,7 @@ public partial class ImmuClient
     /// <param name="key">The lookup key</param>
     /// <param name="tx">The transaction ID</param>
     /// <returns>An <see cref="Entry"/> object. Most often the Value field is used.</returns>
-    public async Task<Entry> GetSinceTx(byte[] key, ulong tx)
+    public async Task<Entry> GetSinceTx(ReadOnlyMemory<byte> key, ulong tx)
     {
         CheckSessionHasBeenOpened();
         ImmudbProxy.KeyRequest req = new ImmudbProxy.KeyRequest()
@@ -887,18 +926,18 @@ public partial class ImmuClient
     /// </summary>
     /// <param name="keys">The list of lookup keys</param>
     /// <returns>A list of <see cref="Entry"/> objects.</returns>
-    public async Task<List<Entry>> GetAll(List<string> keys)
+    public async Task<List<Entry>> GetAll(IEnumerable<string> keys)
     {
         CheckSessionHasBeenOpened();
-        List<ByteString> keysBS = new List<ByteString>(keys.Count);
+        KeyListRequest req = new();
 
         foreach (string key in keys)
         {
-            keysBS.Add(Utils.ToByteString(key));
+            req.Keys.Add(Utils.ToByteString(key));
         }
 
-        ImmudbProxy.KeyListRequest req = new ImmudbProxy.KeyListRequest();
-        req.Keys.AddRange(keysBS);
+        
+        
 
         ImmudbProxy.Entries entries = await Service.GetAllAsync(req, Service.GetHeaders(ActiveSession));
         List<Entry> result = new List<Entry>(entries.Entries_.Count);
@@ -1309,6 +1348,11 @@ public partial class ImmuClient
             throw new CorruptedDataException();
         }
 
+        return ProcessVerifiedSetReferenceResult(reference, referencedKey, atTx, state, verifiableTx);
+    }
+
+    private TxHeader ProcessVerifiedSetReferenceResult(ReadOnlySpan<byte> reference, ReadOnlySpan<byte> referencedKey, in ulong atTx, in ImmuState state, in VerifiableTx verifiableTx)
+    {
         Tx tx;
         try
         {
@@ -1321,7 +1365,9 @@ public partial class ImmuClient
 
         TxHeader txHeader = tx.Header;
 
-        EntrySpec spec = new EntrySpec(reference, null, referencedKey, atTx);
+        Span<byte> wrappedReference = stackalloc byte[referencedKey.Length + 10];
+        EntrySpec.WrapReference(referencedKey, atTx, wrappedReference);
+        EntrySpec spec = new EntrySpec(reference, null, wrappedReference);
         ImmuDB.Crypto.InclusionProof inclusionProof = tx.Proof(spec.GetEncodedKey());
 
         if (!CryptoUtils.VerifyInclusion(inclusionProof, spec.DigestFor(txHeader.Version), txHeader.Eh))

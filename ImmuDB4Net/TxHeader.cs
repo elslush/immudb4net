@@ -21,57 +21,57 @@ namespace ImmuDB;
 /// <summary>
 /// Stores the transaction's header information
 /// </summary>
-public class TxHeader
+public readonly ref struct TxHeader
 {
     /// <summary>
     /// Gets the version
     /// </summary>
     /// <value></value>
-    public int Version { get; private set; }
+    public int Version { get; }
     /// <summary>
     /// Gets the transaction id
     /// </summary>
     /// <value></value>
-    public ulong Id { get; private set; }
+    public ulong Id { get; }
     /// <summary>
     /// Gets the Previous Alh 
     /// </summary>
     /// <value></value>
-    public byte[] PrevAlh { get; private set; }
+    public ReadOnlySpan<byte> PrevAlh { get; }
     /// <summary>
     /// Gets the timestamp in epoch microseconds
     /// </summary>
     /// <value></value>
-    public long Ts { get; private set; }
+    public long Ts { get; }
     /// <summary>
     /// Gets the count of transaction entries
     /// </summary>
     /// <value></value>
-    public int NEntries { get; private set; }
+    public int NEntries { get; }
     /// <summary>
     /// Gets the SHA256 hash value of the hash tree root
     /// </summary>
     /// <value></value>
-    public byte[] Eh { get; private set; }
+    public ReadOnlySpan<byte> Eh { get; }
     /// <summary>
     /// Gets the Bl Transaction ID
     /// </summary>
     /// <value></value>
-    public ulong BlTxId { get; private set; }
+    public ulong BlTxId { get; }
     /// <summary>
     /// Gets the Bl Root
     /// </summary>
     /// <value></value>
-    public byte[] BlRoot { get; private set; }
+    public ReadOnlySpan<byte> BlRoot { get; }
 
-    private static readonly int TS_SIZE = 8;
-    private static readonly int SHORT_SSIZE = 2;
-    private static readonly int LONG_SSIZE = 4;
+    private const int TS_SIZE = 8;
+    private const int SHORT_SSIZE = 2;
+    private const int LONG_SSIZE = 4;
 
-    private static readonly int maxTxMetadataLen = 0;
+    private const int maxTxMetadataLen = 0;
 
-    private TxHeader(int version, ulong id, byte[] prevAlh, long ts, int nEntries,
-                  byte[] eh, ulong blTxId, byte[] blRoot)
+    private TxHeader(int version, ulong id, ReadOnlySpan<byte> prevAlh, long ts, int nEntries,
+                  ReadOnlySpan<byte> eh, ulong blTxId, ReadOnlySpan<byte> blRoot)
     {
         this.Version = version;
         this.Id = id;
@@ -106,59 +106,118 @@ public class TxHeader
     /// Gets the ALH hash code.
     /// </summary>
     /// <returns></returns>
-    public byte[] Alh()
+    public void Alh(Span<byte> output, out int bytesWritten)
     {
         // txID + prevAlh + innerHash
-        MemoryStream bytes = new MemoryStream(Consts.TX_ID_SIZE + 2 * Consts.SHA256_SIZE);
-        using (BinaryWriter bw = new BinaryWriter(bytes))
-        {
-            Utils.WriteWithBigEndian(bw, Id);
-            Utils.WriteArray(bw, PrevAlh);
-            Utils.WriteArray(bw, InnerHash());
-        }
+        Span<byte> bytes = stackalloc byte[Consts.TX_ID_SIZE + 2 * Consts.SHA256_SIZE];
+        Utils.WriteWithBigEndian(bytes[..Consts.TX_ID_SIZE], Id);
+        PrevAlh.CopyTo(bytes.Slice(Consts.TX_ID_SIZE, Consts.SHA256_SIZE));
+        InnerHash(bytes.Slice(Consts.TX_ID_SIZE + Consts.SHA256_SIZE));
 
-        return CryptoUtils.Sha256Sum(bytes.ToArray());
+        //Utils.WriteArray(bytes.Slice(Consts.TX_ID_SIZE, Consts.SHA256_SIZE), PrevAlh);
+
+        //MemoryStream bytes = new MemoryStream();
+        //using (BinaryWriter bw = new BinaryWriter(bytes))
+        //{
+            
+        //    Utils.WriteArray(bw, PrevAlh);
+        //    Utils.WriteArray(bw, InnerHash());
+        //}
+
+        CryptoUtils.Sha256Sum(bytes, output, out bytesWritten);
     }
 
-    private byte[] InnerHash()
+    private void InnerHash(Span<byte> output)
     {
         // ts + version + (mdLen + md)? + nentries + eH + blTxID + blRoot
 
-        MemoryStream bytes = new MemoryStream(TS_SIZE +
-                SHORT_SSIZE + (SHORT_SSIZE + maxTxMetadataLen) +
-                LONG_SSIZE + Consts.SHA256_SIZE +
-                Consts.TX_ID_SIZE + Consts.SHA256_SIZE);
-
-        using (BinaryWriter bw = new BinaryWriter(bytes))
+        int size;
+        switch (Version)
         {
-            Utils.WriteWithBigEndian(bw, Ts);
-            Utils.WriteWithBigEndian(bw, (short)Version);
-
-            switch (Version)
-            {
-                case 0:
-                    {
-                        Utils.WriteWithBigEndian(bw, (short)NEntries);
-                        break;
-                    }
-                case 1:
-                    {
-                        // TODO: add support for TxMetadata
-                        Utils.WriteWithBigEndian(bw, (short)0L);
-                        Utils.WriteWithBigEndian(bw, (uint)NEntries);
-                        break;
-                    }
-                default:
-                    {
-                        throw new InvalidOperationException($"missing tx hash calculation method for version {Version}");
-                    }
-                    // following records are currently common in versions 0 and 1
-            }
-            Utils.WriteArray(bw, Eh);
-            Utils.WriteWithBigEndian(bw, BlTxId);
-            Utils.WriteArray(bw, BlRoot);
+            case 0:
+                size = TS_SIZE +
+                    SHORT_SSIZE + SHORT_SSIZE +
+                    Consts.SHA256_SIZE +
+                    Consts.TX_ID_SIZE + Consts.SHA256_SIZE;
+                break;
+            case 1:
+                size = TS_SIZE +
+                    SHORT_SSIZE + SHORT_SSIZE +
+                    LONG_SSIZE + Consts.SHA256_SIZE +
+                    Consts.TX_ID_SIZE + Consts.SHA256_SIZE;
+                break;
+            default:
+                throw new InvalidOperationException($"missing tx hash calculation method for version {Version}");
         }
 
-        return CryptoUtils.Sha256Sum(bytes.ToArray());
+        Span<byte> bytes = stackalloc byte[size];
+
+        var min = 0;
+
+        Utils.WriteWithBigEndian(bytes.Slice(min += TS_SIZE, TS_SIZE), Ts);
+        Utils.WriteWithBigEndian(bytes.Slice(min += SHORT_SSIZE, SHORT_SSIZE), (short)Version);
+
+        switch (Version)
+        {
+            case 0:
+                {
+                    Utils.WriteWithBigEndian(bytes.Slice(min += SHORT_SSIZE, SHORT_SSIZE), (short)NEntries);
+                    break;
+                }
+            case 1:
+                {
+                    // TODO: add support for TxMetadata
+                    Utils.WriteWithBigEndian(bytes.Slice(min += SHORT_SSIZE, SHORT_SSIZE), (short)0L);
+                    Utils.WriteWithBigEndian(bytes.Slice(min += LONG_SSIZE, SHORT_SSIZE), (uint)NEntries);
+                    break;
+                }
+            default:
+                {
+                    throw new InvalidOperationException($"missing tx hash calculation method for version {Version}");
+                }
+                // following records are currently common in versions 0 and 1
+        }
+        Eh.CopyTo(bytes.Slice(min += Consts.SHA256_SIZE, Consts.SHA256_SIZE));
+        Utils.WriteWithBigEndian(bytes.Slice(min += Consts.TX_ID_SIZE, Consts.TX_ID_SIZE), BlTxId);
+        BlRoot.CopyTo(bytes.Slice(min += Consts.SHA256_SIZE, Consts.SHA256_SIZE));
+
+        CryptoUtils.Sha256Sum(bytes, output, out _);
+
+        //MemoryStream bytes = new MemoryStream(TS_SIZE +
+        //        SHORT_SSIZE + (SHORT_SSIZE + maxTxMetadataLen) +
+        //        LONG_SSIZE + Consts.SHA256_SIZE +
+        //        Consts.TX_ID_SIZE + Consts.SHA256_SIZE);
+
+        //using (BinaryWriter bw = new BinaryWriter(bytes))
+        //{
+        //    Utils.WriteWithBigEndian(bw, Ts);
+        //    Utils.WriteWithBigEndian(bw, (short)Version);
+
+        //    switch (Version)
+        //    {
+        //        case 0:
+        //            {
+        //                Utils.WriteWithBigEndian(bw, (short)NEntries);
+        //                break;
+        //            }
+        //        case 1:
+        //            {
+        //                // TODO: add support for TxMetadata
+        //                Utils.WriteWithBigEndian(bw, (short)0L);
+        //                Utils.WriteWithBigEndian(bw, (uint)NEntries);
+        //                break;
+        //            }
+        //        default:
+        //            {
+        //                throw new InvalidOperationException($"missing tx hash calculation method for version {Version}");
+        //            }
+        //            // following records are currently common in versions 0 and 1
+        //    }
+        //    Utils.WriteArray(bw, Eh);
+        //    Utils.WriteWithBigEndian(bw, BlTxId);
+        //    Utils.WriteArray(bw, BlRoot);
+        //}
+
+        //return CryptoUtils.Sha256Sum(bytes.ToArray());
     }
 }

@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 
+using System.Runtime.InteropServices;
+
 namespace ImmuDB;
 
 
@@ -38,7 +40,7 @@ internal class RandomAssignConnectionPool : IConnectionPool
     private readonly Task cleanupIdleConnections;
     private ManualResetEvent shutdownRequested = new ManualResetEvent(false);
 
-    internal static object instanceSync = new Object();
+    internal static object instanceSync = new();
     internal static RandomAssignConnectionPool? instance = null;
     public static IConnectionPool Instance
     {
@@ -134,33 +136,44 @@ internal class RandomAssignConnectionPool : IConnectionPool
         catch (ObjectDisposedException) { }
     }
 
-    private async Task CleanupIdleConnections(TimeSpan timeout)
+    private Task CleanupIdleConnections(TimeSpan timeout)
     {
-        Dictionary<Item, List<Item>> itemsToClose = new Dictionary<Item, List<Item>>();
+        Task[] shutdownTasks;
+        Tuple<string, Item>[] parentChildList;
         lock (this)
         {
+            // Get number of connections to cleanup
+            var connectionCount = 0;
+            foreach (var addressPool in connections.Values)
+                foreach (var item in addressPool)
+                    if (item.ShouldBeTerminated(timeout))
+                        connectionCount++;
+
+            shutdownTasks = new Task[connectionCount];
+            parentChildList = new Tuple<string, Item>[connectionCount];
+
+            var i = 0;
             foreach (var addressPool in connections)
-            {
-                foreach (var item in addressPool.Value)
-                {
+                foreach (var item in CollectionsMarshal.AsSpan(addressPool.Value))
                     if (item.ShouldBeTerminated(timeout))
                     {
-                        itemsToClose.Add(item, addressPool.Value);
+                        // Collect the shutdown task
+                        shutdownTasks[i] = item.Connection.ShutdownAsync();
+                        // Collect the connection to remove from the connection pool.
+                        // This must happen outside of the loop because you cannot remove items while iterating.
+                        parentChildList[i++] = new Tuple<string, Item>(addressPool.Key, item);
                     }
-                }
-            }
-            foreach (var itemToClose in itemsToClose)
+
+            foreach (var parentChild in parentChildList.AsSpan())
             {
-                itemToClose.Value.Remove(itemToClose.Key);
+                connections[parentChild.Item1].Remove(parentChild.Item2);
             }
         }
-        foreach (var itemToClose in itemsToClose)
-        {
-            await itemToClose.Key.Connection.ShutdownAsync();
-        }
+
+        return Task.WhenAll(shutdownTasks);
     }
 
-    Dictionary<string, List<Item>> connections = new Dictionary<string, List<Item>>();
+    private readonly Dictionary<string, List<Item>> connections = new Dictionary<string, List<Item>>();
 
     public IConnection Acquire(ConnectionParameters cp)
     {
@@ -217,7 +230,7 @@ internal class RandomAssignConnectionPool : IConnectionPool
         }
     }
 
-    public async Task ShutdownAsync()
+    public Task ShutdownAsync()
     {
         try
         {
@@ -226,23 +239,24 @@ internal class RandomAssignConnectionPool : IConnectionPool
         }
         catch (ObjectDisposedException) { }
 
-        Dictionary<string, List<Item>> clone = new Dictionary<string, List<Item>>();
+        Task[] shutdownTasks;
         lock (this)
         {
-            foreach (var addressPool in connections)
-            {
-                List<Item> poolConnections = new List<Item>(addressPool.Value);
-                clone.Add(addressPool.Key, poolConnections);
-            }
+            var connectionCount = 0;
+            foreach (var addressPool in connections.Values)
+                connectionCount += addressPool.Count;
+
+            shutdownTasks = new Task[connectionCount];
+
+            var i = 0;
+            foreach (var addressPool in connections.Values)
+                foreach (var item in CollectionsMarshal.AsSpan(addressPool))
+                    shutdownTasks[i++] = item.Connection.ShutdownAsync();
+
             connections.Clear();
         }
-        foreach (var addressPool in clone)
-        {
-            foreach (var item in addressPool.Value)
-            {
-                await item.Connection.ShutdownAsync();
-            }
-        }
+
+        return Task.WhenAll(shutdownTasks);
     }    
     
     public void Shutdown()
@@ -254,22 +268,23 @@ internal class RandomAssignConnectionPool : IConnectionPool
         }
         catch (ObjectDisposedException) { }
 
-        Dictionary<string, List<Item>> clone = new Dictionary<string, List<Item>>();
+        IConnection[] connectionsClone;
         lock (this)
         {
-            foreach (var addressPool in connections)
-            {
-                List<Item> poolConnections = new List<Item>(addressPool.Value);
-                clone.Add(addressPool.Key, poolConnections);
-            }
+            var connectionCount = 0;
+            foreach (var addressPool in connections.Values)
+                connectionCount += addressPool.Count;
+
+            connectionsClone = new IConnection[connectionCount];
+
+            var i = 0;
+            foreach (var addressPool in connections.Values)
+                foreach (var item in CollectionsMarshal.AsSpan(addressPool))
+                    connectionsClone[i++] = item.Connection;
+
             connections.Clear();
         }
-        foreach (var addressPool in clone)
-        {
-            foreach (var item in addressPool.Value)
-            {
-                item.Connection.Shutdown();
-            }
-        }
+        foreach (var connection in connectionsClone.AsSpan())
+            connection.Shutdown();
     }
 }

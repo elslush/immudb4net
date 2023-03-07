@@ -15,38 +15,44 @@ limitations under the License.
 */
 
 namespace ImmuDB;
+
+using System.Runtime.CompilerServices;
 using Org.BouncyCastle.Crypto;
 
 /// <summary>
 /// Enables the creation of <see cref="ImmuClient" /> instances
 /// </summary>
-public class ImmuClientBuilder
+public ref struct ImmuClientBuilder
 {
+    private const string DefaultSchema = "http://";
+
     /// <summary>
     /// Gets the server URL, such as localhost or http://localhost
     /// </summary>
     /// <value></value>
-    public string ServerUrl { get; private set; }
+    public ReadOnlySpan<char> ServerUrl { get; private set; }
     /// <summary>
     /// Gets the username
     /// </summary>
     /// <value></value>
-    public string Username { get; private set; }
+    public ReadOnlySpan<char> Username { get; private set; }
     /// <summary>
     /// Gets the password
     /// </summary>
     /// <value></value>
-    public string Password { get; private set; }
+    public ReadOnlySpan<char> Password { get; private set; }
     /// <summary>
     /// Gets the database name, such as DefaultDB
     /// </summary>
     /// <value></value>
-    public string Database { get; private set; }
+    public ReadOnlySpan<char> Database { get; private set; }
     /// <summary>
     /// Gets the port number, ex: 3322
     /// </summary>
     /// <value></value>
     public int ServerPort { get; private set; }
+
+    private int serverPortStringLength;
     /// <summary>
     /// Gets the public-private key pair
     /// </summary>
@@ -99,14 +105,55 @@ public class ImmuClientBuilder
     /// Gets the GrpcAddress; it is formed from the ServerUrl and ServerPort parameters
     /// </summary>
     /// <value></value>
-    public string GrpcAddress
+    public string GetGrpcAddress()
     {
-        get
-        {
-            string schema = ServerUrl.StartsWith("http") ? "" : "http://";
-            return $"{schema}{ServerUrl.ToLowerInvariant()}:{ServerPort}";
-        }
+        // Allocate the maximum number of characters on the Stack
+        Span<char> grpcAddress = stackalloc char[GrpcAddressLength];
+
+        // Append the grpc address to the char buffer
+        GetGrpcAddress(ServerUrl, ServerPort, serverPortStringLength, grpcAddress);
+
+        // Copy char buffer to string on Heap
+        return grpcAddress.ToString();
     }
+
+    public int GrpcAddressLength => DefaultSchema.Length + ServerUrl.Length + serverPortStringLength;
+
+    public void GetGrpcAddress(Span<char> grpcAddress)
+    {
+        if (grpcAddress.Length != GrpcAddressLength)
+            throw new InvalidOperationException($"grpcAddress span is not of length: {GrpcAddressLength}, given: {grpcAddress.Length}");
+
+        GetGrpcAddress(ServerUrl, ServerPort, serverPortStringLength, grpcAddress);
+    }
+
+    public static void GetGrpcAddress(ReadOnlySpan<char> serverUrl, in int serverPort, Span<char> grpcAddress)
+        => GetGrpcAddress(serverUrl, serverPort, IntLength(serverPort), grpcAddress);
+
+    public static void GetGrpcAddress(ReadOnlySpan<char> serverUrl, in int serverPort, in int serverPortStringLength, Span<char> grpcAddress)
+    {
+        // Append the default schema if necessary
+        var min = 0;
+        if (!serverUrl.StartsWith("http"))
+            DefaultSchema.AsSpan().CopyTo(grpcAddress.Slice(min += DefaultSchema.Length, DefaultSchema.Length));
+
+        // Append the the url in all lowercase
+        serverUrl.ToLowerInvariant(grpcAddress.Slice(min += serverUrl.Length, serverUrl.Length));
+
+        // Append the Port
+        serverPort.TryFormat(grpcAddress.Slice(min, serverPortStringLength), out _);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int IntLength(in int i)
+    {
+        if (i < 0)
+            throw new ArgumentOutOfRangeException(nameof(i));
+        if (i == 0)
+            return 1;
+        return (int)Math.Floor(Math.Log10(i)) + 1;
+    }
+
     /// <summary>
     /// Gets the length of time the <see cref="ImmuClient.Close" /> function is allowed to block before it completes.
     /// </summary>
@@ -141,7 +188,7 @@ public class ImmuClientBuilder
     /// <param name="username">The username</param>
     /// <param name="password">The password</param>
     /// <returns></returns>
-    public ImmuClientBuilder WithCredentials(string username, string password)
+    public ImmuClientBuilder WithCredentials(ReadOnlySpan<char> username, ReadOnlySpan<char> password)
     {
         this.Username = username;
         this.Password = password;
@@ -153,7 +200,7 @@ public class ImmuClientBuilder
     /// </summary>
     /// <param name="databaseName"></param>
     /// <returns></returns>
-    public ImmuClientBuilder WithDatabase(string databaseName)
+    public ImmuClientBuilder WithDatabase(ReadOnlySpan<char> databaseName)
     {
         this.Database = databaseName;
         return this;
@@ -164,9 +211,10 @@ public class ImmuClientBuilder
     /// </summary>
     /// <param name="serverPort"></param>
     /// <returns></returns>
-    public ImmuClientBuilder WithServerPort(int serverPort)
+    public ImmuClientBuilder WithServerPort(in int serverPort)
     {
         this.ServerPort = serverPort;
+        serverPortStringLength = IntLength(serverPort);
         return this;
     }
 
@@ -175,7 +223,7 @@ public class ImmuClientBuilder
     /// </summary>
     /// <param name="serverUrl"></param>
     /// <returns></returns>
-    public ImmuClientBuilder WithServerUrl(string serverUrl)
+    public ImmuClientBuilder WithServerUrl(ReadOnlySpan<char> serverUrl)
     {
         this.ServerUrl = serverUrl;
         return this;
@@ -208,7 +256,7 @@ public class ImmuClientBuilder
     /// </summary>
     /// <param name="publicKeyFileName"></param>
     /// <returns></returns>
-    public ImmuClientBuilder WithServerSigningKey(string publicKeyFileName)
+    public ImmuClientBuilder WithServerSigningKey(in string publicKeyFileName)
     {
         this.ServerSigningKey = ImmuState.GetPublicKeyFromPemFile(publicKeyFileName);
         return this;

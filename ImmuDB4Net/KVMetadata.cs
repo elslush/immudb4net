@@ -19,29 +19,37 @@ namespace ImmuDB;
 /// <summary>
 /// Represents the database key-value metadata
 /// </summary>
-public class KVMetadata
+public readonly struct KVMetadata
 {
 
-    internal static readonly byte deletedAttrCode = 0;
-    internal static readonly byte expiresAtAttrCode = 1;
-    internal static readonly byte nonIndexableAttrCode = 2;
+    internal const byte deletedAttrCode = 0;
+    internal const byte expiresAtAttrCode = 1;
+    internal const byte nonIndexableAttrCode = 2;
 
-    private static readonly int deletedAttrSize = 0;
-    private static readonly int expiresAtAttrSize = 8;
-    private static readonly int nonIndexableAttrSize = 0;
+    private readonly bool hasDeleted, nonIndexable;
+    private readonly long? expirationTime;
+    private readonly int serializationLength;
 
-    private static readonly int maxKVMetadataLen = (MetadataAttribute.AttrCodeSize + deletedAttrSize) +
-                                                (MetadataAttribute.AttrCodeSize + expiresAtAttrSize) +
-                                                (MetadataAttribute.AttrCodeSize + nonIndexableAttrSize);
-
-    private Dictionary<Byte, MetadataAttribute> attributes;
+    //private Dictionary<byte, MetadataAttribute> attributes;
 
     /// <summary>
     /// Creates an empty KV metadata
     /// </summary>
-    public KVMetadata()
+    public KVMetadata(bool hasDeleted, bool nonIndexable, long? expirationTime)
     {
-        attributes = new Dictionary<Byte, MetadataAttribute>();
+        this.hasDeleted = hasDeleted;
+        this.nonIndexable = nonIndexable;
+        this.expirationTime = expirationTime;
+
+        var serializationLength = 0;
+        if (hasDeleted)
+            serializationLength += 1;
+        if (nonIndexable)
+            serializationLength += 1;
+        if (expirationTime is not null)
+            serializationLength += 9;
+
+        this.serializationLength = serializationLength;
     }
 
     /// <summary>
@@ -51,96 +59,25 @@ public class KVMetadata
     /// <returns></returns>
     public static KVMetadata ValueOf(ImmudbProxy.KVMetadata md)
     {
-        KVMetadata metadata = new KVMetadata();
-
-        metadata.AsDeleted(md.Deleted);
-
-        if (md.Expiration != null)
-        {
-            metadata.ExpiresAt(md.Expiration.ExpiresAt);
-        }
-
-        metadata.AsNonIndexable(md.NonIndexable);
-
-        return metadata;
-    }
-
-    private void AsDeleted(bool deleted)
-    {
-        if (!deleted)
-        {
-            attributes.Remove(deletedAttrCode);
-            return;
-        }
-
-        if (!attributes.ContainsKey(deletedAttrCode))
-        {
-            attributes[deletedAttrCode] = new DeletedAttribute();
-        }
-
-        return;
+        return new(md.Deleted, md.NonIndexable, md.Expiration?.ExpiresAt);
     }
 
     /// <summary>
     /// Is true if the deleted attribute is present
     /// </summary>
-    public bool Deleted => attributes.ContainsKey(deletedAttrCode);
-
-    private void AsNonIndexable(bool nonIndexable)
-    {
-        if (!nonIndexable)
-        {
-            attributes.Remove(nonIndexableAttrCode);
-            return;
-        }
-
-        if (!attributes.ContainsKey(nonIndexableAttrCode))
-        {
-            attributes[nonIndexableAttrCode] = new NonIndexableAttribute();
-        }
-
-        return;
-    }
+    public bool Deleted => hasDeleted;
 
     /// <summary>
     /// Is true if the non indexable attribute is set
     /// </summary>
     /// <value></value>
-    public bool NonIndexable
-    {
-        get
-        {
-            return attributes.ContainsKey(nonIndexableAttrCode);
-        }
-    }
-
-    private void ExpiresAt(long expirationTime)
-    {
-        ExpiresAtAttribute expiresAt;
-
-        if (attributes.ContainsKey(expiresAtAttrCode))
-        {
-            expiresAt = (ExpiresAtAttribute)attributes[expiresAtAttrCode];
-            expiresAt.ExpiresAt = expirationTime;
-        }
-        else
-        {
-            expiresAt = new ExpiresAtAttribute(expirationTime);
-            attributes[expiresAtAttrCode] = expiresAt;
-        }
-    }
+    public bool NonIndexable => nonIndexable;
 
     /// <summary>
     /// Is true if the attributes contain expiration
     /// </summary>
     /// <value></value>
-    public bool HasExpirationTime
-    {
-        get
-        {
-            return attributes.ContainsKey(expiresAtAttrCode);
-        }
-    }
+    public bool HasExpirationTime => expirationTime is not null;
 
     /// <summary>
     /// Gets the expiration time
@@ -150,133 +87,39 @@ public class KVMetadata
     {
         get
         {
-            if (!attributes.ContainsKey(expiresAtAttrCode))
+            if (expirationTime is null)
             {
                 throw new InvalidOperationException("no expiration time set");
             }
-            return DateTimeOffset.FromUnixTimeSeconds(((ExpiresAtAttribute)attributes[expiresAtAttrCode]).ExpiresAt).DateTime;
+            return DateTimeOffset.FromUnixTimeSeconds((long)expirationTime).DateTime;
         }
     }
+
+    public int SerializedLength => serializationLength;
+
 
     /// <summary>
     /// Serializes to byte array
     /// </summary>
     /// <returns></returns>
-    public byte[] Serialize()
+    public bool Serialize(Span<byte> result)
     {
-        MemoryStream bytes = new MemoryStream(maxKVMetadataLen);
+        if (result.Length != serializationLength)
+            return false;
 
-        foreach (byte attrCode in new byte[] { deletedAttrCode, expiresAtAttrCode, nonIndexableAttrCode })
+        var i = 0;
+        if (hasDeleted)
+            result[i++] = deletedAttrCode;
+
+        if (nonIndexable)
+            result[i++] = nonIndexableAttrCode;
+
+        if (expirationTime is not null)
         {
-            if (attributes.ContainsKey(attrCode))
-            {
-                bytes.WriteByte(attrCode);
-                byte[] payload = attributes[attrCode].Serialize();
-                bytes.Write(payload, 0, payload.Length);
-            }
+            result[i++] = nonIndexableAttrCode;
+            Utils.WriteWithBigEndian(result.Slice(i, 8), (long)expirationTime);
         }
 
-        return bytes.ToArray();
-    }
-}
-
-/// <summary>
-/// Represents the deleted attribute
-/// </summary>
-public class DeletedAttribute : MetadataAttribute
-{
-    /// <summary>
-    /// Gets the deleted attribute code
-    /// </summary>
-    /// <returns></returns>
-    public override byte Code()
-    {
-        return KVMetadata.deletedAttrCode;
-    }
-
-    /// <summary>
-    /// Serializes the attribute
-    /// </summary>
-    /// <returns></returns>
-    public override byte[] Serialize()
-    {
-        return new byte[] { };
-    }
-}
-
-/// <summary>
-/// Represents 'the expires at' attribute
-/// </summary>
-public class ExpiresAtAttribute : MetadataAttribute
-{
-    /// <summary>
-    /// Gets or Sets the expires at value
-    /// </summary>
-    /// <value></value>
-    public long ExpiresAt { get; set; }
-    
-    /// <summary>
-    /// Creates an instance of ExpiresAtAttribute
-    /// </summary>
-    /// <param name="expiresAt">The expiration time specified in epoch seconds</param>
-    public ExpiresAtAttribute(long expiresAt)
-    {
-        this.ExpiresAt = expiresAt;
-    }
-    
-    /// <summary>
-    /// Creates an instance of ExpiresAtAttribute
-    /// </summary>
-    /// <param name="expiresAt">The expiration time</param>
-    public ExpiresAtAttribute(DateTime expiresAt)
-    {
-        this.ExpiresAt = new DateTimeOffset(expiresAt).ToUnixTimeSeconds();
-    }
-
-    /// <summary>
-    /// Gets the attribute code
-    /// </summary>
-    /// <returns></returns>
-    public override byte Code()
-    {
-        return KVMetadata.expiresAtAttrCode;
-    }
-
-    /// <summary>
-    /// Serializes the attribute to byte array
-    /// </summary>
-    /// <returns></returns>
-    public override byte[] Serialize()
-    {
-        var bytes = BitConverter.GetBytes(ExpiresAt);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(bytes);
-        }
-        return bytes;
-    }
-}
-
-/// <summary>
-/// Represents the non-indexable attribute
-/// </summary>
-public class NonIndexableAttribute : MetadataAttribute
-{
-    /// <summary>
-    /// Gets the attribute code
-    /// </summary>
-    /// <returns></returns>
-    public override byte Code()
-    {
-        return KVMetadata.nonIndexableAttrCode;
-    }
-
-    /// <summary>
-    /// Serializes the attribute to byte array
-    /// </summary>
-    /// <returns></returns>
-    public override byte[] Serialize()
-    {
-        return new byte[] { };
+        return true;
     }
 }

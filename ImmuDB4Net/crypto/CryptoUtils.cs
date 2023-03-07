@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
+using CommunityToolkit.HighPerformance;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
 
@@ -27,44 +29,37 @@ internal static class CryptoUtils
     // [227 176 196 66 152 252 28 20 154 251 244 200 153 111 185 36 39 174 65 228 100 155 147 76 164 149 153 27 120 82 184 85]
     // whose Base64 encoded value is 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=.
     // So we treat this case as in Go.
-    private static byte[] SHA256_SUM_OF_NULL = Convert.FromBase64String("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=");
+    private static readonly byte[] SHA256_SUM_OF_NULL = Convert.FromBase64String("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=");
 
     /// <summary>
     /// This method returns a SHA256 digest of the provided data.
     /// </summary>
     /// <param name="data"></param>
     /// <returns></returns>
-    public static byte[] Sha256Sum(byte[] data)
+    public static bool Sha256Sum(ReadOnlySpan<byte> data, Span<byte> output, out int bytesWritten)
     {
         if ((data == null) || data.Length == 0)
         {
-            return SHA256_SUM_OF_NULL;
+            var isSuccess = SHA256_SUM_OF_NULL.AsSpan().TryCopyTo(output);
+            if (isSuccess)
+                bytesWritten = SHA256_SUM_OF_NULL.Length;
+            else
+                bytesWritten = 0;
+            return isSuccess;
         }
-        using (SHA256 sha256Hash = SHA256.Create())
-        {
-            var result = sha256Hash.ComputeHash(data);
-
-            return result;
-        }
+        
+        return SHA256.TryHashData(data, output, out bytesWritten);
     }
 
-    public static byte[][] DigestsFrom(RepeatedField<ByteString> terms)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void DigestsFrom(in RepeatedField<ByteString> terms, Span2D<byte> result)
     {
         if (terms == null)
-        {
-            return new byte[][] { };
-        }
-        int size = terms.Count;
-        byte[][] result = new byte[size][];
-        for (int i = 0; i < size; i++)
-        {
-            // the statements below could have easily been replaced with : results[i] = terms[i].ToByteArray(), but the solution below 
-            // limits the size of each item in the jagged array
-            result[i] = new byte[Consts.SHA256_SIZE];
-            byte[] term = terms[i].ToByteArray();
-            Array.Copy(term, 0, result[i], 0, Consts.SHA256_SIZE);
-        }
-        return result;
+            return;
+
+        for (int i = 0; i < terms.Count; i++)
+            for (int j = 0; j < SHA256.HashSizeInBytes; j++)
+                result[i, j] = terms[i][j];
     }
 
     /// <summary>
@@ -72,95 +67,101 @@ internal static class CryptoUtils
     /// </summary>
     /// <param name="digest"></param>
     /// <returns></returns>
-    public static byte[] DigestFrom(byte[] digest)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool DigestFrom(ReadOnlySpan<byte> digest, Span<byte> result)
     {
-        if(digest == null)
-        {
-            return new byte[] { };
-        }
-        if (digest.Length != Consts.SHA256_SIZE)
-        {
-            return new byte[] { };
-        }
-        byte[] d = new byte[Consts.SHA256_SIZE];
-        Array.Copy(digest, 0, d, 0, Consts.SHA256_SIZE);
-        return d;
+        if(digest == null || digest.Length != result.Length)
+            return false;
+
+        return digest.TryCopyTo(result);
     }
 
-    public static bool VerifyInclusion(byte[][] iProof, ulong i, ulong j, byte[] iLeaf,
-        byte[] jRoot)
+    public static bool VerifyInclusion(Span2D<byte> iProof, ulong i, ulong j, ReadOnlySpan<byte> iLeaf, ReadOnlySpan<byte> jRoot)
     {
         if (i > j || i == 0 || (i < j && iProof.Length == 0))
-        {
             return false;
-        }
-        byte[] ciRoot = evalInclusion(iProof, i, j, iLeaf);
+
+        Span<byte> ciRoot = stackalloc byte[iLeaf.Length];
+        iLeaf.CopyTo(ciRoot);
+
+        evalInclusion(iProof, i, j, ciRoot);
         return jRoot.SequenceEqual(ciRoot);
     }
 
-    private static byte[] evalInclusion(byte[][] iProof, ulong i, ulong j, byte[] iLeaf)
+    private static void evalInclusion(Span2D<byte> iProof, ulong i, ulong j,  Span<byte> ciRoot)
     {
         ulong i1 = i - 1;
         ulong j1 = j - 1;
-        byte[] ciRoot = iLeaf;
 
-        byte[] b = new byte[1 + Consts.SHA256_SIZE * 2];
+        Span<byte> b = stackalloc byte[1 + SHA256.HashSizeInBytes * 2];
         b[0] = Consts.NODE_PREFIX;
 
-        foreach (byte[] h in iProof)
+        for (int rowNum = 0; rowNum < iProof.Height; rowNum++)
         {
+            Span<byte> h = iProof.GetRowSpan(rowNum);
             if (i1 % 2 == 0 && i1 != j1)
             {
-                Array.Copy(ciRoot, 0, b, 1, ciRoot.Length);
-                Array.Copy(h, 0, b, Consts.SHA256_SIZE + 1, h.Length);
+                ciRoot.CopyTo(b.Slice(1));
+                h.CopyTo(ciRoot.Slice(SHA256.HashSizeInBytes + 1));
+                //Array.Copy(ciRoot, 0, b, 1, ciRoot.Length);
+                //Array.Copy(h, 0, b, SHA256.HashSizeInBytes + 1, h.Length);
             }
             else
             {
-                Array.Copy(h, 0, b, 1, h.Length);
-                Array.Copy(ciRoot, 0, b, Consts.SHA256_SIZE + 1, ciRoot.Length);
+                h.CopyTo(b.Slice(1));
+                ciRoot.CopyTo(b.Slice(SHA256.HashSizeInBytes + 1));
+                //Array.Copy(h, 0, b, 1, h.Length);
+                //Array.Copy(ciRoot, 0, b, SHA256.HashSizeInBytes + 1, ciRoot.Length);
             }
 
-            ciRoot = Sha256Sum(b);
+            Sha256Sum(b, ciRoot, out _);
             i1 >>= 1;
             j1 >>= 1;
         }
-
-        return ciRoot;
     }
 
-    public static bool VerifyInclusion(InclusionProof proof, byte[] digest, byte[] root)
+    public static bool VerifyInclusion(InclusionProof proof, ReadOnlySpan<byte> digest, ReadOnlySpan<byte> root)
     {
         if (proof == null)
         {
             return false;
         }
 
-        byte[] leaf = new byte[1 + Consts.SHA256_SIZE];
+        Span<byte> leaf = stackalloc byte[1 + SHA256.HashSizeInBytes];
         leaf[0] = Consts.LEAF_PREFIX;
-        Array.Copy(digest, 0, leaf, 1, digest.Length);
-        byte[] calcRoot = Sha256Sum(leaf);
+        digest.CopyTo(leaf.Slice(1));
+        //Array.Copy(digest, 0, leaf, 1, digest.Length);
+
+        Span<byte> calcRoot = stackalloc byte[SHA256.HashSizeInBytes];
+        Sha256Sum(leaf, calcRoot, out _);
         int i = proof.Leaf;
         int r = proof.Width - 1;
 
         if (proof.Terms != null)
         {
+            Span<byte> b = new byte[1 + 2 * SHA256.HashSizeInBytes];
+            b[0] = Consts.NODE_PREFIX;
+
             for (int j = 0; j < proof.Terms.Length; j++)
             {
-                byte[] b = new byte[1 + 2 * Consts.SHA256_SIZE];
-                b[0] = Consts.NODE_PREFIX;
-
                 if (i % 2 == 0 && i != r)
                 {
-                    Array.Copy(calcRoot, 0, b, 1, calcRoot.Length);
-                    Array.Copy(proof.Terms[j], 0, b, 1 + Consts.SHA256_SIZE, proof.Terms[j].Length);
+                    calcRoot.CopyTo(b.Slice(1));
+                    proof.Terms[j].CopyTo(b.Slice(1 + SHA256.HashSizeInBytes));
+
+                    //Array.Copy(calcRoot, 0, b, 1, calcRoot.Length);
+                    //Array.Copy(proof.Terms[j], 0, b, 1 + SHA256.HashSizeInBytes, proof.Terms[j].Length);
                 }
                 else
                 {
-                    Array.Copy(proof.Terms[j], 0, b, 1, proof.Terms[j].Length);
-                    Array.Copy(calcRoot, 0, b, 1 + Consts.SHA256_SIZE, calcRoot.Length);
+                    proof.Terms[j].CopyTo(b.Slice(1));
+                    calcRoot.CopyTo(b.Slice(1 + SHA256.HashSizeInBytes));
+
+                    //Array.Copy(proof.Terms[j], 0, b, 1, proof.Terms[j].Length);
+                    //Array.Copy(calcRoot, 0, b, 1 + SHA256.HashSizeInBytes, calcRoot.Length);
                 }
 
-                calcRoot = Sha256Sum(b);
+                Sha256Sum(b, calcRoot, out _);
                 i /= 2;
                 r /= 2;
             }
@@ -169,10 +170,10 @@ internal static class CryptoUtils
         return i == r && root.SequenceEqual(calcRoot);
     }
 
-    internal static bool VerifyDualProof(DualProof proof, ulong sourceTxId, ulong targetTxId,
-            byte[] sourceAlh, byte[] targetAlh)
+    internal static bool VerifyDualProof(in DualProof proof, in ulong sourceTxId, in ulong targetTxId,
+        ReadOnlySpan<byte> sourceAlh, ReadOnlySpan<byte> targetAlh)
     {
-        if (proof == null || proof.SourceTxHeader == null || proof.TargetTxHeader == null
+        if (proof.SourceTxHeader == null || proof.TargetTxHeader == null
                 || proof.SourceTxHeader.Id != sourceTxId
                 || proof.TargetTxHeader.Id != targetTxId)
         {
@@ -231,7 +232,7 @@ internal static class CryptoUtils
 
     private static byte[] leafFor(byte[] d)
     {
-        byte[] b = new byte[1 + Consts.SHA256_SIZE];
+        byte[] b = new byte[1 + SHA256.HashSizeInBytes];
         b[0] = Consts.LEAF_PREFIX;
         Array.Copy(d, 0, b, 1, d.Length);
         return Sha256Sum(b);
@@ -258,10 +259,10 @@ internal static class CryptoUtils
 
         for (int i = 1; i < proof.Terms.Length; i++)
         {
-            byte[] bs = new byte[Consts.TX_ID_SIZE + 2 * Consts.SHA256_SIZE];
+            byte[] bs = new byte[Consts.TX_ID_SIZE + 2 * SHA256.HashSizeInBytes];
             Utils.PutUint64(proof.SourceTxId + (ulong)i, bs);
             Array.Copy(calculatedAlh, 0, bs, Consts.TX_ID_SIZE, calculatedAlh.Length);
-            Array.Copy(proof.Terms[i], 0, bs, Consts.TX_ID_SIZE + Consts.SHA256_SIZE, proof.Terms[i].Length);
+            Array.Copy(proof.Terms[i], 0, bs, Consts.TX_ID_SIZE + SHA256.HashSizeInBytes, proof.Terms[i].Length);
             calculatedAlh = Sha256Sum(bs);
         }
 
@@ -282,13 +283,13 @@ internal static class CryptoUtils
         ulong i1 = i - 1;
         byte[] root = leaf;
 
-        byte[] b = new byte[1 + Consts.SHA256_SIZE * 2];
+        byte[] b = new byte[1 + SHA256.HashSizeInBytes * 2];
         b[0] = Consts.NODE_PREFIX;
 
         foreach (byte[] h in iProof)
         {
             Array.Copy(h, 0, b, 1, h.Length);
-            Array.Copy(root, 0, b, Consts.SHA256_SIZE + 1, root.Length);
+            Array.Copy(root, 0, b, SHA256.HashSizeInBytes + 1, root.Length);
             root = Sha256Sum(b);
             i1 >>= 1;
         }
@@ -332,7 +333,7 @@ internal static class CryptoUtils
         byte[] ciRoot = cProof[0];
         byte[] cjRoot = cProof[0];
 
-        byte[] b = new byte[1 + Consts.SHA256_SIZE * 2];
+        byte[] b = new byte[1 + SHA256.HashSizeInBytes * 2];
         b[0] = Consts.NODE_PREFIX;
 
         for (int k = 1; k < cProof.Length; k++)
@@ -342,10 +343,10 @@ internal static class CryptoUtils
             {
                 Array.Copy(h, 0, b, 1, h.Length);
 
-                Array.Copy(ciRoot, 0, b, 1 + Consts.SHA256_SIZE, ciRoot.Length);
+                Array.Copy(ciRoot, 0, b, 1 + SHA256.HashSizeInBytes, ciRoot.Length);
                 ciRoot = Sha256Sum(b);
 
-                Array.Copy(cjRoot, 0, b, 1 + Consts.SHA256_SIZE, cjRoot.Length);
+                Array.Copy(cjRoot, 0, b, 1 + SHA256.HashSizeInBytes, cjRoot.Length);
                 cjRoot = Sha256Sum(b);
 
                 while (fn % 2 == 0 && fn != 0)
@@ -357,7 +358,7 @@ internal static class CryptoUtils
             else
             {
                 Array.Copy(cjRoot, 0, b, 1, cjRoot.Length);
-                Array.Copy(h, 0, b, 1 + Consts.SHA256_SIZE, h.Length);
+                Array.Copy(h, 0, b, 1 + SHA256.HashSizeInBytes, h.Length);
                 cjRoot = Sha256Sum(b);
             }
             fn >>= 1;

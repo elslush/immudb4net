@@ -14,10 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics.Arm;
 using System.Security.Cryptography;
 using System.Text;
+using CommunityToolkit.HighPerformance;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
+using ImmuDB.Crypto;
 
 namespace ImmuDB;
 
@@ -31,14 +36,13 @@ public static class Utils
     /// </summary>
     /// <param name="str">The source string</param>
     /// <returns>The gRPC ByteString </returns>
-    public static ByteString ToByteString(string str)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ByteString ToByteString(in string str)
     {
         if (str == null)
-        {
             return ByteString.Empty;
-        }
 
-        return ByteString.CopyFrom(str, Encoding.UTF8);
+        return ByteString.CopyFromUtf8(str);
     }
 
     /// <summary>
@@ -46,14 +50,24 @@ public static class Utils
     /// </summary>
     /// <param name="b">The source byte array</param>
     /// <returns>The gRPC ByteString </returns>
-    public static ByteString ToByteString(byte[] b)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ByteString ToByteString(in byte[] bytes)
     {
-        if (b == null)
+        if (bytes is null || bytes.Length < 1)
+            return ByteString.Empty;
+
+        return ByteString.CopyFrom(bytes);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ByteString ToByteString(ReadOnlyMemory<byte> bytes)
+    {
+        if (bytes.Length < 1)
         {
             return ByteString.Empty;
         }
 
-        return ByteString.CopyFrom(b);
+        return UnsafeByteOperations.UnsafeWrap(bytes);
     }
 
     /// <summary>
@@ -61,37 +75,47 @@ public static class Utils
     /// </summary>
     /// <param name="str">The source string</param>
     /// <returns>The converted byte array </returns>
-    public static byte[] ToByteArray(string str)
-    {
-        if (str == null)
-        {
-            return new byte[] { };
-        }
+    //public static byte[] ToByteArray(string str)
+    //{
+    //    if (str == null)
+    //    {
+    //        return Array.Empty<byte>()
+    //    }
 
-        return Encoding.UTF8.GetBytes(str);
+    //    return Encoding.UTF8.GetBytes(str);
+    //}
+
+    //public static int ToByteArray(ReadOnlySpan<char> str, Memory<byte> buffer, )
+    //{
+
+    //    var bufferSpan = buffer[..byteCount].Span;
+
+    //    return Encoding.UTF8.GetBytes(str, bufferSpan);
+    //}
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static bool WrapWithPrefix(ReadOnlySpan<byte> key, Span<byte> result,  byte prefix)
+    {
+        if (key.Length < 1)
+            return false;
+
+        result[0] = prefix;
+
+        return key.TryCopyTo(result.Slice(1, key.Length));
     }
 
-    internal static byte[] WrapWithPrefix(byte[] b, byte prefix)
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static bool WrapReferenceValueAt(ReadOnlySpan<byte> key, Span<byte> result, ulong atTx)
     {
-        if (b == null)
-        {
-            return new byte[] { };
-        }
-        byte[] wb = new byte[b.Length + 1];
-        wb[0] = prefix;
-        Array.Copy(b, 0, wb, 1, b.Length);
-        return wb;
-    }
+        if (result.Length < 9)
+            return false;
 
-    internal static byte[] WrapReferenceValueAt(byte[] key, ulong atTx)
-    {
-        byte[] refVal = new byte[1 + 8 + key.Length];
-        refVal[0] = Consts.REFERENCE_VALUE_PREFIX;
+        result[0] = Consts.REFERENCE_VALUE_PREFIX;
 
-        Utils.PutUint64(atTx, refVal, 1);
+        if (!PutUint64(atTx, result, 1))
+            return false;
 
-        Array.Copy(key, 0, refVal, 1 + 8, key.Length);
-        return refVal;
+        return key.TryCopyTo(result.Slice(9, key.Length));
     }
 
     /// <summary>
@@ -99,145 +123,230 @@ public static class Utils
     /// </summary>
     /// <param name="data"></param>
     /// <returns></returns>
-    public static byte[][] ConvertSha256ListToBytesArray(RepeatedField<ByteString> data)
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static bool ConvertSha256ListToBytesArray(in RepeatedField<ByteString> data, Span2D<byte> result)
     {
         if (data == null)
-        {
-            return new byte[][] { };
-        }
-        int size = data.Count;
-        byte[][] result = new byte[size][];
-        for (int i = 0; i < size; i++)
-        {
-            byte[] item = data[i].ToByteArray();
-            result[i] = new byte[32];
-            Array.Copy(item, result[i], Math.Max(32, item.Length));
-        }
-        return result;
+            return false;
+
+        for (int i = 0; i < data.Count; i++)
+            if (!data[i].Span[..32].TryCopyTo(result.GetRowSpan(i)))
+                return false;
+
+        return true;
     }
 
-    internal static void PutUint32(int value, byte[] dest, int destPos)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool PutUint32(in int value, Span<byte> dest, in int destPos)
     {
         // Considering gRPC's generated code that maps Go's uint32 and int32 to C#'s int,
         // this is basically the version of this Go code:
         // binary.BigEndian.PutUint32(target[targetIdx:], value)
-        var valueBytes = BitConverter.GetBytes(value);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(valueBytes);
-        }
-        Array.Copy(valueBytes, 0, dest, destPos, valueBytes.Length);
+        Span<byte> destTemp = stackalloc byte[4];
+        if (!BitConverter.TryWriteBytes(destTemp, value))
+            return false;
+
+        if (!BitConverter.IsLittleEndian)
+            destTemp.Reverse();
+
+        return destTemp.TryCopyTo(dest.Slice(destPos, destTemp.Length));
     }
 
-    internal static void PutUint64(ulong value, byte[] dest)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool PutUint64(in ulong value, Span<byte> dest)
     {
-        PutUint64(value, dest, 0);
+        return PutUint64(value, dest, 0);
     }
 
-    internal static void PutUint64(ulong value, byte[] dest, int destPos)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool PutUint64(in ulong value, Span<byte> dest, in int destPos)
     {
         // Considering gRPC's generated code that maps Go's uint64 and int64 to Java's long,
         // this is basically the Java version of this Go code:
         // binary.BigEndian.PutUint64(target[targetIdx:], value)
-        var valueBytes = BitConverter.GetBytes(value);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(valueBytes);
-        }
-        Array.Copy(valueBytes, 0, dest, destPos, valueBytes.Length);
-    }
+        Span<byte> destTemp = stackalloc byte[8];
+        if (!BitConverter.TryWriteBytes(destTemp, value))
+            return false;
 
-    internal static void WriteLittleEndian(BinaryWriter bw, ulong item)
-    {
-        var content = BitConverter.GetBytes(item);
         if (!BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(content);
-        }
-        bw.Write(content);
+            destTemp.Reverse();
+
+        return destTemp.TryCopyTo(dest.Slice(destPos, destTemp.Length));
     }
 
-    internal static void WriteWithBigEndian(BinaryWriter bw, ulong item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteLittleEndian(Span<byte> result, in ulong item)
     {
-        var content = BitConverter.GetBytes(item);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(content);
-        }
-        bw.Write(content);
+        if (BitConverter.TryWriteBytes(result, item) && !BitConverter.IsLittleEndian)
+            result.Reverse();
     }
 
-    internal static void WriteWithBigEndian(BinaryWriter bw, uint item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteWithBigEndian(Span<byte> result, in ulong item)
     {
-        var content = BitConverter.GetBytes(item);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(content);
-        }
-        bw.Write(content);
+        if (BitConverter.TryWriteBytes(result, item) && BitConverter.IsLittleEndian)
+            result.Reverse();
     }
 
-    internal static void WriteWithBigEndian(BinaryWriter bw, ushort item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteWithBigEndian(Span<byte> result, in uint item)
     {
-        var content = BitConverter.GetBytes(item);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(content);
-        }
-        bw.Write(content);
+        if (BitConverter.TryWriteBytes(result, item) && BitConverter.IsLittleEndian)
+            result.Reverse();
     }
 
-    internal static void WriteWithBigEndian(BinaryWriter bw, long item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteWithBigEndian(Span<byte> result, in ushort item)
     {
-        var content = BitConverter.GetBytes(item);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(content);
-        }
-        bw.Write(content);
+        if (BitConverter.TryWriteBytes(result, item) && BitConverter.IsLittleEndian)
+            result.Reverse();
     }
 
-    internal static void WriteWithBigEndian(BinaryWriter bw, double item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteWithBigEndian(Span<byte> result, in long item)
     {
-        var content = BitConverter.GetBytes(item);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(content);
-        }
-        bw.Write(content);
+        if (BitConverter.TryWriteBytes(result, item) && BitConverter.IsLittleEndian)
+            result.Reverse();
     }
 
-    internal static void WriteWithBigEndian(BinaryWriter bw, short item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteWithBigEndian(Span<byte> result, in double item)
     {
-        var content = BitConverter.GetBytes(item);
-        if (BitConverter.IsLittleEndian)
-        {
-            Array.Reverse(content);
-        }
-        bw.Write(content);
+        if (BitConverter.TryWriteBytes(result, item) && BitConverter.IsLittleEndian)
+            result.Reverse();
     }
 
-    internal static void WriteArray(BinaryWriter bw, byte[]? item)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteWithBigEndian(Span<byte> result, in short item)
+    {
+        if (BitConverter.TryWriteBytes(result, item) && BitConverter.IsLittleEndian)
+            result.Reverse();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool WriteArray(Span<byte> result, ReadOnlySpan<byte> item)
     {
         if ((item == null) || (item.Length == 0))
         {
-            return;
+            return false;
         }
-        bw.Write(item);
+        return item.TryCopyTo(result);
     }
 
-    internal static string GenerateShortHash(string source)
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static bool GenerateShortHash(ReadOnlySpan<char> source, Span<char> shortHash)
     {
-        using (SHA256 sha256 = SHA256.Create())
+        Span<char> shortHashTemp = stackalloc char[SHA256.HashSizeInBytes];
+        if (!GetSHA256Upper(source, shortHashTemp))
+            return false;
+
+        var previousCopyIndex = 0;
+        var previousShortHashIndex = 0;
+        int i;
+        int length;
+        for (i = 0; i < shortHashTemp.Length; i++)
         {
-            var result = sha256.ComputeHash(Encoding.UTF8.GetBytes(source));
-            var hash = Convert.ToBase64String(result).ToUpper()
-                .Replace("=", "")
-                .Replace("+", "-")
-                .Replace("/", "_")
-                .Substring(0, 30);
-            return hash;
+            switch (shortHashTemp[i])
+            {
+                // Change temp character span in place
+                case '+':
+                    shortHashTemp[i] = '-';
+                    break;
+                // Change temp character span in place
+                case '/':
+                    shortHashTemp[i] = '_';
+                    break;
+                // Copy from temp to destination in bulk using
+                // ReadOnlySpan<T>.CopyTo because Memmove is fastest.
+                case '=':
+                    // Length of short hash array until '=' is detected
+                    // (because we want to discard '=')
+                    length = i - 1 - previousCopyIndex;
+
+                    // Make sure we don't go over 30 characters in shortHash
+                    length += Math.Max(0, 30 - (previousShortHashIndex + length));
+
+                    // Copy
+                    shortHashTemp
+                        .Slice(previousCopyIndex, length)
+                        .CopyTo(shortHash.Slice(previousShortHashIndex, length));
+
+                    previousCopyIndex += i - 1;
+                    previousShortHashIndex += i - 1;
+
+                    if (previousShortHashIndex >= 30)
+                        return true;
+                    break;
+                default:
+                    break;
+            }
         }
+
+        // Bulk Copy remaining
+        length = i - previousCopyIndex;
+        length += Math.Max(0, 30 - (previousShortHashIndex + length));
+        if (length < 30)
+        {
+            shortHashTemp
+                    .Slice(previousCopyIndex, length)
+                    .CopyTo(shortHash.Slice(previousShortHashIndex, length));
+        }
+
+        return true;
+
+        //using (SHA256 sha256 = SHA256.Create())
+        //{
+        //    source.r
+        //    var result = sha256.ComputeHash(Encoding.UTF8.GetBytes(source));
+        //    var hash = Convert.ToBase64String(result).ToUpper()
+        //        .Replace("=", "")
+        //        .Replace("+", "-")
+        //        .Replace("/", "_")
+        //        .Substring(0, 30);
+        //    return hash;
+        //}
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool GetSHA256Upper(ReadOnlySpan<char> source, Span<char> shortHash)
+    {
+        Span<char> shortHashTemp = stackalloc char[SHA256.HashSizeInBytes];
+        if (!GetSHA256Chars(source, shortHashTemp))
+            return false;
+
+        ReadOnlySpan<char> shortHashTempReadonly = shortHashTemp;
+
+        var shaCount = shortHashTempReadonly.ToUpper(shortHash, System.Globalization.CultureInfo.InvariantCulture);
+        if (shaCount != SHA256.HashSizeInBytes)
+            return false;
+
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool GetSHA256Chars(ReadOnlySpan<char> source, Span<char> shortHashTemp)
+    {
+        Span<byte> sha = stackalloc byte[SHA256.HashSizeInBytes];
+        int shaCount = GetSHA256(source, sha);
+        if (shaCount != SHA256.HashSizeInBytes)
+            return false;
+
+        if (!Convert.TryToBase64Chars(sha, shortHashTemp, out int charsWritten))
+            return false;
+
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int GetSHA256(ReadOnlySpan<char> source, Span<byte> result)
+    {
+        var byteCount = Encoding.UTF8.GetByteCount(source);
+        Span<byte> sourceBytes = stackalloc byte[byteCount];
+        byteCount = Encoding.UTF8.GetBytes(source, sourceBytes);
+
+        if (CryptoUtils.Sha256Sum(sourceBytes[..byteCount], result, out byteCount))
+            return byteCount;
+
+        return 0;
+    }
 }

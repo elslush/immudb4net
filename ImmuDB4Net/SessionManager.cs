@@ -14,16 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+using System.Buffers;
 using System.Collections.Concurrent;
+using System.Text;
 using Google.Protobuf.WellKnownTypes;
 using ImmudbProxy;
+using static ImmudbProxy.ImmuService;
 
 namespace ImmuDB;
 
 internal interface ISessionManager
 {
-    Task<Session> OpenSessionAsync(IConnection connection, string username, string password, string initialDbName);
-    Session OpenSession(IConnection connection, string username, string password, string initialDbName);
+    Task<Session> OpenSessionAsync(IConnection connection, ReadOnlySpan<char> username, ReadOnlySpan<char> password, in string initialDbName);
+    Session OpenSession(IConnection connection, ReadOnlySpan<char> username, ReadOnlySpan<char> password, in string initialDbName);
     Task CloseSessionAsync(IConnection connection, Session? session);
     void CloseSession(IConnection connection, Session? session);
 }
@@ -40,16 +43,28 @@ internal class DefaultSessionManager : ISessionManager
     }
     private ConcurrentDictionary<string, Session> sessions = new ConcurrentDictionary<string, Session>();
 
-    public async Task<Session> OpenSessionAsync(IConnection connection, string username, string password, string initialDbName)
+    public Task<Session> OpenSessionAsync(IConnection connection, ReadOnlySpan<char> username, ReadOnlySpan<char> password, in string initialDbName)
     {
+        var usernameByteCount = Encoding.UTF8.GetByteCount(username);
+        var passwordByteCount = Encoding.UTF8.GetByteCount(password);
+
+        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(usernameByteCount + passwordByteCount);
         
-        OpenSessionRequest openSessionRequest = new OpenSessionRequest()
+        Encoding.UTF8.GetBytes(username, owner.Memory.Span[..usernameByteCount]);
+        Encoding.UTF8.GetBytes(password, owner.Memory.Span.Slice(usernameByteCount, passwordByteCount));
+
+        OpenSessionRequest openSessionRequest = new()
         {
-            Username = Utils.ToByteString(username),
-            Password = Utils.ToByteString(password),
+            Username = Utils.ToByteString(owner.Memory[..usernameByteCount]),
+            Password = Utils.ToByteString(owner.Memory.Slice(usernameByteCount, passwordByteCount)),
             DatabaseName = initialDbName
         };
 
+        return OpenSessionAsync(connection, openSessionRequest);
+    }
+
+    public async Task<Session> OpenSessionAsync(IConnection connection, OpenSessionRequest openSessionRequest)
+    {
         var result = await connection.Service.OpenSessionAsync(openSessionRequest);
         var session = new Session(result.SessionID, result.ServerUUID)
         {
@@ -58,17 +73,29 @@ internal class DefaultSessionManager : ISessionManager
         sessions[result.SessionID] = session;
         return session;
     }
-    
-    public Session OpenSession(IConnection connection, string username, string password, string initialDbName)
+
+    public Session OpenSession(IConnection connection, ReadOnlySpan<char> username, ReadOnlySpan<char> password, in string initialDbName)
     {
-        
-        OpenSessionRequest openSessionRequest = new OpenSessionRequest()
+        var usernameByteCount = Encoding.UTF8.GetByteCount(username);
+        var passwordByteCount = Encoding.UTF8.GetByteCount(password);
+
+        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(usernameByteCount + passwordByteCount);
+
+        Encoding.UTF8.GetBytes(username, owner.Memory.Span[..usernameByteCount]);
+        Encoding.UTF8.GetBytes(password, owner.Memory.Span.Slice(usernameByteCount, passwordByteCount));
+
+        OpenSessionRequest openSessionRequest = new()
         {
-            Username = Utils.ToByteString(username),
-            Password = Utils.ToByteString(password),
+            Username = Utils.ToByteString(owner.Memory[..usernameByteCount]),
+            Password = Utils.ToByteString(owner.Memory.Slice(usernameByteCount, passwordByteCount)),
             DatabaseName = initialDbName
         };
 
+        return OpenSession(connection, openSessionRequest);
+    }
+
+    public Session OpenSession(IConnection connection, OpenSessionRequest openSessionRequest)
+    {
         var result = connection.Service.OpenSession(openSessionRequest);
         var session = new Session(result.SessionID, result.ServerUUID)
         {
@@ -84,7 +111,7 @@ internal class DefaultSessionManager : ISessionManager
         {
             return;
         }
-        await connection.Service.CloseSessionAsync(new Empty(), connection.Service.GetHeaders(session));
+        await connection.Service.CloseSessionAsync(new Empty(), ImmuServiceClient.GetHeaders(session));
         sessions.TryRemove(session.Id, out _);
     }
     public void CloseSession(IConnection connection, Session? session)
@@ -93,7 +120,7 @@ internal class DefaultSessionManager : ISessionManager
         {
             return;
         }
-        connection.Service.CloseSession(new Empty(), connection.Service.GetHeaders(session));
+        connection.Service.CloseSession(new Empty(), ImmuServiceClient.GetHeaders(session));
         sessions.TryRemove(session.Id, out _);
     }
 }

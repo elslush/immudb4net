@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+using CommunityToolkit.HighPerformance;
 using ImmuDB.Crypto;
 
 namespace ImmuDB;
@@ -73,11 +74,17 @@ public class Tx
         return tx;
     }
 
+    public int HTreeDigestBufferCount => Entries.Count * Consts.SHA256_SIZE;
+
     /// <summary>
     /// Builds the hash tree from the entries
     /// </summary>
-    public void BuildHashTree()
+    public void BuildHashTree(Span<byte> hTreeBuffer)
     {
+        if (hTreeBuffer.Length != HTreeDigestBufferCount)
+            throw new InvalidOperationException($"HTree Buffer must contain: {HTreeDigestBufferCount} bytes");
+
+        Span2D<byte> digests = new Span2D<byte>(hTreeBuffer, 3, 3);
         byte[][] digests = new byte[Entries.Count][];
         for (int i = 0; i < Entries.Count; i++)
         {

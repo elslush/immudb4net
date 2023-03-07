@@ -16,15 +16,15 @@ limitations under the License.
 
 namespace ImmuDB.Crypto;
 
-internal class DualProof {
+internal readonly ref struct DualProof {
 
-    public TxHeader SourceTxHeader {get; private set;}
-    public TxHeader TargetTxHeader {get; private set;}
-    public byte[][] InclusionProof {get; private set;}
-    public byte[][] ConsistencyProof {get; private set;}
-    public byte[] targetBlTxAlh {get; private set;}
-    public byte[][] LastInclusionProof {get; private set;}
-    public LinearProof LinearProof {get; private set;}
+    public TxHeader SourceTxHeader { get; }
+    public TxHeader TargetTxHeader { get; }
+    public byte[][] InclusionProof { get; }
+    public byte[][] ConsistencyProof { get; }
+    public byte[] targetBlTxAlh { get; }
+    public byte[][] LastInclusionProof { get; }
+    public LinearProof LinearProof { get; }
 
     public DualProof(TxHeader sourceTxHeader,
                      TxHeader targetTxHeader,

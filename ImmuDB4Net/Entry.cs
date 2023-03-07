@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+using System.Security.Cryptography;
 using System.Text;
 
 namespace ImmuDB;
@@ -20,41 +21,50 @@ namespace ImmuDB;
 /// <summary>
 /// Represents an ImmuDB value, such as the value of a specific key
 /// </summary>
-public class Entry
+public readonly struct Entry
 {
     /// <summary>
     /// Gets the transaction ID
     /// </summary>
     /// <value></value>
-    public ulong Tx { get; private set; }
+    public ulong Tx { get; }
 
     /// <summary>
     /// Gets the key
     /// </summary>
     /// <value></value>
-    public byte[] Key { get; private set; }
+    public ReadOnlyMemory<byte> Key { get; }
 
     /// <summary>
     /// Gets the value
     /// </summary>
     /// <value></value>
-    public byte[] Value { get; private set; }
+    public ReadOnlyMemory<byte> Value { get; }
 
     /// <summary>
     /// Gets the metadata
     /// </summary>
     /// <value></value>
-    public KVMetadata? Metadata { get; private set; }
+    public KVMetadata? Metadata { get; }
 
     /// <summary>
     /// Gets the reference
     /// </summary>
     /// <value></value>
-    public Reference? ReferencedBy { get; private set; }
+    public Reference? ReferencedBy { get; }
 
-    private Entry(byte[] key, byte[] value) {
+    private Entry(ulong tx,
+        ReadOnlyMemory<byte> key,
+        ReadOnlyMemory<byte> value,
+        KVMetadata? metadata,
+        Reference? referencedBy
+    )
+    {
+        Tx = tx;
         Key = key;
         Value = value;
+        Metadata = metadata;
+        ReferencedBy = referencedBy;
     }
 
     /// <summary>
@@ -63,10 +73,11 @@ public class Entry
     /// <returns></returns>
     public override string ToString()
     {
-        if((Value == null) || (Value.Length == 0)) {
+        if(Value.Length == 0)
+        {
             return "";
         }
-        return Encoding.UTF8.GetString(Value);
+        return Encoding.UTF8.GetString(Value.Span);
     }
 
     /// <summary>
@@ -77,18 +88,13 @@ public class Entry
     public static Entry ValueOf(ImmudbProxy.Entry e)
     {
         ImmudbProxy.Entry proxyInst = e ?? ImmudbProxy.Entry.DefaultInstance;
-        Entry entry = new Entry(proxyInst.Key.ToByteArray(), proxyInst.Value.ToByteArray());
-        entry.Tx = proxyInst.Tx;
-
-        if (proxyInst.Metadata != null)
-        {
-            entry.Metadata = KVMetadata.ValueOf(proxyInst.Metadata);
-        }
-
-        if (proxyInst.ReferencedBy != null)
-        {
-            entry.ReferencedBy = Reference.ValueOf(proxyInst.ReferencedBy);
-        }
+        Entry entry = new(
+            proxyInst.Tx,
+            proxyInst.Key.Memory,
+            proxyInst.Value.Memory,
+            proxyInst.Metadata is null ? null : KVMetadata.ValueOf(proxyInst.Metadata),
+            proxyInst.ReferencedBy is null ? null : Reference.ValueOf(proxyInst.ReferencedBy)
+        );
 
         return entry;
     }
@@ -96,44 +102,65 @@ public class Entry
     /// <summary>
     /// Gets the encoded key
     /// </summary>
-    /// <returns></returns>
-    public byte[] GetEncodedKey()
+    /// <returns>Whether the key was copied successfully</returns>
+    public bool GetEncodedKey(Span<byte> result)
     {
         if (ReferencedBy == null)
         {
-            return Utils.WrapWithPrefix(Key, Consts.SET_KEY_PREFIX);
+            return Utils.WrapWithPrefix(Key.Span, result, Consts.SET_KEY_PREFIX);
         }
 
-        return Utils.WrapWithPrefix(ReferencedBy.Key, Consts.SET_KEY_PREFIX);
+        return Utils.WrapWithPrefix(ReferencedBy.Value.Key.Span, result, Consts.SET_KEY_PREFIX);
     }
+
+    /// <summary>
+    /// Gets the encoded key Length.
+    /// </summary>
+    /// <returns></returns>
+    public int GetEncodedKeyLength => ReferencedBy is null
+        ? Key.Length + 1
+        : ReferencedBy.Value.Key.Length + 1;
 
     /// <summary>
     /// Gets the digest for a version
     /// </summary>
     /// <param name="version">The version</param>
     /// <returns></returns>
-    public byte[] DigestFor(int version)
+    public bool DigestFor(in int version, Span<byte> result)
     {
-        KV kv;
+        if (result.Length != Consts.SHA256_SIZE)
+            throw new InvalidOperationException($"result must be of length: {Consts.SHA256_SIZE}, given: {result.Length}");
 
-        if (ReferencedBy == null)
+        Span<byte> encodedKey = stackalloc byte[GetEncodedKeyLength];
+        if (!GetEncodedKey(encodedKey))
+            return false;
+
+        if (ReferencedBy is null)
         {
-            kv = new KV(
-                    GetEncodedKey(),
+            Span<byte> value = stackalloc byte[Value.Length + 1];
+            if (!Utils.WrapWithPrefix(Value.Span, value, Consts.PLAIN_VALUE_PREFIX))
+                return false;
+
+            var kv = new KV(
+                    encodedKey,
                     Metadata,
-                    Utils.WrapWithPrefix(Value, Consts.PLAIN_VALUE_PREFIX)
+                    value
             );
+            return kv.DigestFor(version, result);
         }
         else
         {
-            kv = new KV(
-                    GetEncodedKey(),
-                    ReferencedBy.Metadata,
-                    Utils.WrapReferenceValueAt(Utils.WrapWithPrefix(Key, Consts.SET_KEY_PREFIX), ReferencedBy.AtTx)
+            Span<byte> value = stackalloc byte[Value.Length + 10];
+            value[0] = Consts.SET_KEY_PREFIX;
+            if (!Utils.WrapReferenceValueAt(Key.Span, value, ReferencedBy.Value.AtTx))
+                return false;
+
+            var kv = new KV(
+                    encodedKey,
+                    ReferencedBy.Value.Metadata,
+                    value
             );
+            return kv.DigestFor(version, result);
         }
-
-        return kv.DigestFor(version);
     }
-
 }

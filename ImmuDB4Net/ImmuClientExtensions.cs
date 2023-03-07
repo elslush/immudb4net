@@ -26,17 +26,22 @@ namespace ImmudbProxy
         {
             internal const string SESSIONID_HEADER = "sessionid";
 
-            private Metadata headers = new Metadata();
-            private Object headersSync = new Object();
+            private static string? cachedKey;
+            private static Metadata? cachedMetadata;
 
-            internal Metadata GetHeaders(Session? session)
+            internal static Metadata GetHeaders(Session? session)
             {
-                var mdata = new Metadata();
                 if (session?.Id != null)
                 {
+                    if (cachedMetadata is not null
+                        && cachedKey is not null
+                        && cachedKey.AsSpan().SequenceEqual(session.Id.AsSpan()))
+                        return cachedMetadata;
+                    var mdata = new Metadata();
                     mdata.Add(SESSIONID_HEADER, session.Id);
+                    return mdata;
                 }
-                return mdata;
+                return new Metadata();
             }
         }
     }

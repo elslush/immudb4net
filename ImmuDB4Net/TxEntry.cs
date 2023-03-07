@@ -14,40 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+using Google.Protobuf;
+using Google.Protobuf.WellKnownTypes;
 using ImmuDB.Crypto;
+using ImmudbProxy;
 
 namespace ImmuDB;
 
 /// <summary>
 /// Represents A transaction entry that belongs to a <see cref="Tx" /> class
 /// </summary>
-public class TxEntry
+public readonly ref struct TxEntry
 {
     /// <summary>
     /// Gets the key
     /// </summary>
     /// <value></value>
-    public byte[] Key {get; private set;}
+    public ReadOnlySpan<byte> Key { get; }
     /// <summary>
     /// The transaction metadata
     /// </summary>
     /// <value></value>
-    public KVMetadata Metadata {get; private set;}
+    public KVMetadata? Metadata { get; }
     /// <summary>
     /// The VLength parameter
     /// </summary>
     /// <value></value>
-    public int VLength {get; private set;}
+    public int VLength { get; }
     /// <summary>
     /// The hash value
     /// </summary>
     /// <value></value>
-    public byte[] HVal {get; private set;}
+    public ReadOnlySpan<byte> HVal { get; }
 
-    private TxEntry(byte[] key, KVMetadata metadata, int vLength, byte[] hVal)
+    private TxEntry(ReadOnlySpan<byte> key, KVMetadata metadata, int vLength, ReadOnlySpan<byte>  hVal)
     {
-        this.Key = new byte[key.Length];
-        Array.Copy(key, 0, this.Key, 0, key.Length);
+        //this.Key = new byte[key.Length];
+        //Array.Copy(key, 0, this.Key, 0, key.Length);
+        this.Key = key;
 
         this.Metadata = metadata;
         this.VLength = vLength;
@@ -69,7 +73,7 @@ public class TxEntry
         }
 
         return new TxEntry(
-                        txe.Key.ToByteArray(),
+                        txe.Key.Span,
                         md,
                         txe.VLen,
                         CryptoUtils.DigestFrom(txe.HValue.ToByteArray())
@@ -81,65 +85,84 @@ public class TxEntry
     /// </summary>
     /// <param name="version">The version number</param>
     /// <returns></returns>
-    public byte[] DigestFor(int version)
+    public bool DigestFor(in int version, Span<byte> result)
     {
-        switch (version)
-        {
-            case 0: return Digest_v0();
-            case 1: return Digest_v1();
-        }
+        if (result.Length != 32)
+            return false;
 
-        throw new InvalidOperationException("unsupported tx header version");
+        return version switch
+        {
+            0 => Digest_v0(result),
+            1 => Digest_v1(result),
+            _ => throw new InvalidOperationException("unsupported tx header version"),
+        };
     }
 
     /// <summary>
     /// Calculates the digest for version 0
     /// </summary>
     /// <returns></returns>
-    public byte[] Digest_v0()
+    public bool Digest_v0(Span<byte> result)
     {
         if (Metadata != null)
         {
             throw new InvalidOperationException("metadata is unsupported when in 1.1 compatibility mode");
         }
 
-        byte[] b = new byte[Key.Length + Consts.SHA256_SIZE];
+        Span<byte> b = stackalloc byte[Key.Length + Consts.SHA256_SIZE];
 
-        Array.Copy(Key, 0, b, 0, Key.Length);
-        Array.Copy(HVal, 0, b, Key.Length, HVal.Length);
+        Key.CopyTo(b[..Key.Length]);
+        HVal.CopyTo(b.Slice(Key.Length, Consts.SHA256_SIZE));
+        //Array.Copy(Key, 0, b, 0, Key.Length);
+        //Array.Copy(HVal, 0, b, Key.Length, HVal.Length);
 
-        return CryptoUtils.Sha256Sum(b);
+        return CryptoUtils.Sha256Sum(b, result, out _);
     }
 
     /// <summary>
     /// Calculates the digest for version 1
     /// </summary>
     /// <returns></returns>
-    public byte[] Digest_v1()
+    public bool Digest_v1(Span<byte> result)
     {
-        byte[] mdbs = new byte[0];
-        int mdLen = 0;
+        int mdLen = Metadata is null
+            ? 0
+            : Metadata.Value.SerializedLength;
 
-        if (Metadata != null)
-        {
-            mdbs = Metadata.Serialize();
-            mdLen = mdbs.Length;
-        }
+        Span<byte> bytes = stackalloc byte[2 + mdLen + 2 + Key.Length + Consts.SHA256_SIZE];
+        var min = 0;
 
-        MemoryStream bytes = new MemoryStream(2 + mdLen + 2 + Key.Length + Consts.SHA256_SIZE);
-        using (BinaryWriter bw = new BinaryWriter(bytes)) 
-        {
-            Utils.WriteWithBigEndian(bw, (short)mdLen);
-            if (mdLen > 0)
-            {
-                Utils.WriteArray(bw, mdbs);
-            }
-            Utils.WriteWithBigEndian(bw, (short)Key.Length);
-            Utils.WriteArray(bw, Key);
-            Utils.WriteArray(bw, HVal);
+        Utils.WriteWithBigEndian(bytes.Slice(min += 2, 2), (short)mdLen);
+        if (Metadata is not null)
+            Metadata.Value.Serialize(bytes.Slice(min += mdLen, mdLen));
+        Utils.WriteWithBigEndian(bytes.Slice(min += 2, 2), (short)Key.Length);
+        Key.CopyTo(bytes.Slice(min += Key.Length, Key.Length));
+        HVal.CopyTo(bytes.Slice(min, Consts.SHA256_SIZE));
+        return CryptoUtils.Sha256Sum(bytes, result, out _);
 
-        }
-        return CryptoUtils.Sha256Sum(bytes.ToArray());
+        //byte[] mdbs = new byte[0];
+        //int mdLen = 0;
+
+        //if (Metadata != null)
+        //{
+        //    mdbs = Metadata.Serialize();
+        //    mdLen = mdbs.Length;
+        //}
+
+        //MemoryStream bytes = new MemoryStream(2 + mdLen + 2 + Key.Length + Consts.SHA256_SIZE);
+        //using (BinaryWriter bw = new BinaryWriter(bytes)) 
+        //{
+        //    Utils.WriteWithBigEndian(bw, (short)mdLen);
+        //    if (mdLen > 0)
+        //    {
+        //        Utils.WriteArray(bw, mdbs);
+        //    }
+        //    Utils.WriteWithBigEndian(bw, (short)Key.Length);
+        //    Utils.WriteArray(bw, Key);
+        //    Utils.WriteArray(bw, HVal);
+
+        //}
+        //return CryptoUtils.Sha256Sum(bytes.ToArray());
     }
 
 }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-namespace ImmuDB;
+namespace ImmuDB.StateHolders;
 
 /// <summary>
 /// Represents the abstraction for the state holder. This allow the creation of custom state holders, such as in a distributed KV or in memory
@@ -42,11 +42,11 @@ public interface IImmuStateHolder
     /// <param name="session">The session object</param>
     /// <param name="database">The database name</param>
     /// <returns></returns>
-    ImmuState? GetState(Session? session, string database);
+    ValueTask<ImmuState?> GetState(Session? session, string dbname, CancellationToken cancellationToken = default);
     /// <summary>
     /// Sets the state of an immudb database
     /// </summary>
     /// <param name="session">The session object</param>
     /// <param name="state">The state to be stored</param>
-    void SetState(Session session, ImmuState state);
+    Task SetState(Session session, ImmuState state, CancellationToken cancellationToken = default);
 }
